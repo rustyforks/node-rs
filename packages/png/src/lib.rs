@@ -1,11 +1,13 @@
 #[macro_use]
 extern crate napi_rs as napi;
 
-use futures::io::{copy, AllowStdIo};
+use futures::channel::oneshot::channel;
+use futures::FutureExt;
 use image::png::PngDecoder;
 use image::ImageDecoder;
 use napi::{Any, Buffer, Env, Error, Object, Result, Status, Value};
 use std::ops::Deref;
+use std::thread;
 
 register_module!(node_rs_png, init);
 
@@ -22,7 +24,7 @@ fn decode<'a>(
   _this: Value<'a, Any>,
   args: &[Value<'a, Any>],
 ) -> Result<Option<Value<'a, Any>>> {
-  let async_context = env.async_init(None, "test_spawn");
+  let async_context = env.async_init(None, "PROMISE");
   let png_data: Value<Buffer> = args
     .get(0)
     .map(|v| Value::<Buffer>::from_value(env, v))
@@ -37,34 +39,33 @@ fn decode<'a>(
     dbg!("{:?}", e);
     Error::new(Status::GenericFailure)
   })?;
-  let total_bytes = decoder.total_bytes() as usize;
-  let async_reader = AllowStdIo::new(decoder.into_reader().map_err(|e| {
-    dbg!("{:?}", e);
-    Error::new(Status::GenericFailure)
-  })?);
+  let (sender, receiver) = channel();
+  thread::spawn(|| {
+    let total_bytes = decoder.total_bytes() as usize;
+    let mut output = vec![0; total_bytes];
+    decoder.read_image(&mut output).unwrap();
+    sender.send(output).unwrap();
+  });
 
   let (promise, deferred) = env.create_promise();
-  let task = async move {
-    let mut output = vec![0; total_bytes];
-    match copy(async_reader, &mut output).await {
-      Ok(_) => {
-        async_context.enter(move |env| {
-          env.resolve_deferred(deferred, env.create_buffer_with_data(output));
-        });
-      }
-      Err(e) => {
-        dbg!("{:?}", &e);
-        async_context.enter(move |env| {
-          env.reject_deferred(
-            deferred,
-            env.create_error(Status::GenericFailure, &format!("{:?}", e)),
-          );
-        });
-      }
+  let task = receiver.map(move |val| match val {
+    Ok(value) => {
+      async_context.enter(move |env| {
+        env.resolve_deferred(deferred, env.create_buffer_with_data(value));
+      });
     }
-  };
+    Err(e) => {
+      dbg!("{:?}", e);
+      async_context.enter(move |env| {
+        env.resolve_deferred(
+          deferred,
+          env.create_error(Status::GenericFailure, &format!("{:?}", e)),
+        );
+      });
+    }
+  });
 
-  env.create_executor().execute(task);
+  env.execute_future(task);
 
   Ok(Some(promise.try_into().unwrap()))
 }

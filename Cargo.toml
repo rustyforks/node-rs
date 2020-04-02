@@ -1,4 +1,5 @@
 [workspace]
 members = [
-  "./packages/png"
+  "./packages/png",
+  "./packages/skia"
 ]
